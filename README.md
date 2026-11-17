@@ -118,3 +118,100 @@ python demo/cli_smoke.py    # 六个 CLI 接口端到端
 规模关卡的典型实测（4×75,000 行、8 分区、每分区 64KiB 溢写阈值、5 个工人进程）：
 875 个溢写段（清理后 winner 段 700 个）、工人峰值 RSS ≈ 20 MiB、
 读取端流式峰值约 60 KiB（对照全量 `list` 收集同分区约 35 MiB）。
+
+---
+
+# 双输入关联算子（shuffle.join）
+
+在交换层之上新增的可落盘双输入关联：**直接消费两个既有作业的 winner 段**
+（可不同 root、不同分区数、不同分区版本；同一作业同时作为左右输入也合法，
+左右角色各自登记独立保护），产出自己的关联结果文件。不读原始 split 文件，
+不把交换层另写一份，也不用 SQL JOIN 或任何现成查询引擎代算——键对齐、
+分组关联、热点乘积枚举、结果次序恢复全部在 `shuffle/join.py` 内以
+流式磁盘算法完成；SQLite 只保存协调状态、磁盘索引与检查点。
+
+```
+shuffle/
+  join_common.py  框式落盘流（逐记录摘要）、文件句柄账本、预算核算、同步关卡
+  join.py         关联算子：create/run/status/read/delete 与六个执行阶段
+  join_cli.py     命令行接口（python -m shuffle.join_cli ...）
+demo/
+  join_ref.py        朴素参考实现（内存字典，不调用产品关联逻辑）
+  join_demo.py       功能关卡 J1–J13（真实上游工人建输入）
+  join_scale_demo.py 规模关卡：双侧输入超内存 / 热键组超内存 / 指标报告
+```
+
+## 使用方式
+
+```bash
+# 建关联：固定两侧 winner 清单并登记持久段保护（任一侧未就绪/已取消/
+# 绑定非法都显式失败，且不在另一侧留下永不释放的引用）
+python -m shuffle.join_cli create --workdir .run/work --name j1 \
+    --left-root .run/rootL --left-job jobL \
+    --right-root .run/rootR --right-job jobR \
+    --mode full --mem-bytes 268435456 --max-open-files 32 \
+    --result-kind full          # full=完整原行（含 value）；identity=只存身份字段
+
+python -m shuffle.join_cli run    --workdir .run/work --name j1   # 中断后再跑即恢复
+python -m shuffle.join_cli status --workdir .run/work --name j1   # 阶段进度/接收范围/源段读取计数
+python -m shuffle.join_cli read   --workdir .run/work --name j1 --start 0 --count 100
+python -m shuffle.join_cli delete --workdir .run/work --name j1   # 释放自己的保护并移除目录
+```
+
+库接口：`shuffle.join.create_join / run_join / join_status / JoinResult / delete_join`；
+`JoinResult.read(start, count)` 分页与 `JoinResult.iter(start)` 迭代器拼接一致。
+
+## 执行链与检查点持久边界
+
+```
+bind      校验两侧绑定，固定 winner 清单快照，在源作业 readers 表登记持久保护
+receive   逐源段校验（长度/身份/行摘要/段摘要）→ 追加接收流 → fsync → 落段级检查点
+normalize 按 (split 清单序, row_number) k 路归并出两侧源序流（扇入受文件预算限制）
+keysort   右侧按键字节外排 + 稀疏索引（null 键不进键流：null 永不匹配）
+emit      左流按源序探测右键流，同键组流式枚举 m×n；left/full 补未匹配左行
+emit_tail 仅 full：按右源序补未匹配右行（磁盘位图标记已匹配）
+finalize  结果整流核验（逐条摘要/序号连续/计数/流摘要）→ 写 footer 后才可读
+```
+
+持久边界（全部先 fsync 文件、再提交 SQLite 检查点）：
+
+* **receive**：每个源段一个检查点。恢复时已接收段**绝不重读**（状态可查
+  `receive.{L,R}` 与计数器 `src_segments_read`）；接收一半的段截掉重收；
+* **normalize/keysort**：阶段级检查点，产物为一次性文件（tmp+原子改名），
+  恢复复用前整流校验摘要，未完成的中间 run 留在 `tmp/` 随阶段重启清理；
+* **emit/emit_tail**：每 `checkpoint_rows` 结果行一个检查点（左/右源序位置、
+  输出字节、索引字节、位图同步）。恢复截断到检查点重做未落定部分；
+* **finalize**：整流核验通过才写 footer 并置 `done`。**只有 `done` 才可读**——
+  被杀在终验前，已写出的前缀不被当作完成；结果落盘后的长度/顺序/数量/
+  内容损坏，读取都显式报错。
+
+同步关卡（`SHUFFLE_JOIN_HOOK` 或 `run --hook`，供测试在指定位置杀进程）：
+`kill-after-receive-segment=k`（接收第 k 段后）、`kill-after-receive`、
+`kill-after-normalize`、`kill-after-keysort`、`kill-at-emit=n`（第 n 条结果）、
+`kill-before-finalize`（结果可读前）。受控终止退出码 42。
+
+## 语义要点
+
+* **键**：精确 text 相等（不去空白、不折叠大小写、按 UTF-8 字节）；null 永不
+  相等（含 null 对 null）；空串/Unicode/含 NUL 的合法 text 各按自身值；
+  分区桶相同不等于键相等（null 与文本 `"\u0000NULL"` 同桶但不误配）；
+* **重数**：同键左 m 行 × 右 n 行 = m×n 对，重复内容行各自参与；
+* **次序**：左 split 清单序 + split 内 row_number；匹配右行按右源序；
+  full 末尾按右源序追加未匹配右行；结果序号从 0 连续；
+* **结果行**：`{seq, left, right}`，左右为完整原行（split_id/row_number/key/
+  value），未匹配侧整个字段为 null——与合法的 null value 严格区分；
+* **预算**：总工作内存（单行上限=预算/16，超限显式报错）与同时打开文件数
+  （句柄账本强制，峰值落库）；不把整边/整分区/同键大组/全部输出装进内存；
+* **段保护**：加工期间源作业 destroy 被拒（进程被杀后保护仍有效）；源作业
+  之后取消不换输入、不吞行；结果交付后释放保护，源作业可销毁而结果仍可读；
+  删除关联只释放它自己的保护，不影响别的 reader 或关联。
+
+## 关联演示
+
+```bash
+python demo/join_demo.py        # 功能关卡 J1–J13（规定小例/键语义/随机交叉核对/
+                                # 分页/空侧/自关联/失败场景/保护生命周期/杀进程恢复/
+                                # 结果损坏/预算/分区规则无关性/CLI 端到端）
+python demo/join_scale_demo.py  # 规模关卡：双侧输入超内存、热键组超内存、
+                                # 峰值 RSS/临时磁盘/打开文件/源段读取计数报告
+```
