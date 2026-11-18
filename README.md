@@ -215,3 +215,169 @@ python demo/join_demo.py        # 功能关卡 J1–J13（规定小例/键语义
 python demo/join_scale_demo.py  # 规模关卡：双侧输入超内存、热键组超内存、
                                 # 峰值 RSS/临时磁盘/打开文件/源段读取计数报告
 ```
+
+---
+
+# 双时间历史表（shuffle.history）
+
+上游每天送来的归属记录会**追溯修改**过去的生效区间、也会**撤回**误报。历史表
+在交换层之上持续维护两条时间轴，回答"**在当时已知的信息下，这个客户那一天
+归谁**"：业务人员既能查今天认可的历史（head），也能重现上周报表使用的历史
+（任意旧知识版本，永不改写）。
+
+* **知识版本 K**（1,2,3,…）：一个已提交批次占一个版本，表示"何时获知这批
+  事实"（不是业务生效时间）。空批次也占一个版本。版本只增不改。
+* **业务时间 T**：有符号 64 位整数；断言区间左闭右开 `[valid_from, valid_to)`，
+  `valid_to` 为 null 表示正无穷。
+
+```
+shuffle/
+  history.py    历史表：建表/建批/接收/暂存/提交/放弃 + 点查/时间线/差异/导出
+  hist_cli.py   命令行接口（python -m shuffle.hist_cli ...）
+demo/
+  history_ref.py        独立小规模参考实现（不调用产品区间逻辑）
+  history_demo.py       功能关卡 H1–H8（真实工人建输入，逐项对照参考）
+  history_scale_demo.py 规模关卡 S1–S3（实体总数/单实体历史超内存）
+  hist_child.py         演示子进程（并发提交裁决、受计量入仓/导出）
+```
+
+## 事实模型与裁定规则
+
+源行 `key` 是实体的精确 text 标识（null 非法；空串、NUL、Unicode 合法，不
+修剪、不折叠大小写）。`value` 是一条断言或撤回：
+
+* 断言 `{"event_id","op":"assert","valid_from","valid_to","payload"}`；
+  payload 可为任意标准 JSON 值（含 null）。结果中独立的 `present` 存在标记
+  区分"无事实"（空洞，`present=false`）与"事实值为 null"（`present=true`）。
+* 撤回 `{"event_id","op":"retract","target_event_id"}`；目标必须是同一实体
+  在**更早知识版本**已提交、尚未撤回的断言。撤回从它所属版本起生效，不改写
+  旧版本的认知；被覆盖的旧断言保留，上层被撤回后下层重新露出（可能只露出
+  原区间的一部分）。撤回本身不接受被撤回。
+* `event_id` 全表全局唯一（断言与撤回同一命名空间）；同内容不同 event_id
+  仍是两条事实。重复 ID、错实体撤回、前向引用、再次撤回都使**整批**被拒绝，
+  不静默去重。
+
+在知识版本 K、业务时点 T 的裁定：只考虑版本 ≤ K 的断言与 ≤ K 已发生的撤回；
+仍有效且覆盖 T 的断言中，按 `(kversion, split 清单序, row_number)` 取**后者**
+优先（知识版本越大越优先；同批内 split 清单次序靠后者优先，再同则 row_number
+大者优先）。不以桶号、工人完成顺序或文件遍历顺序决胜。
+
+## 使用方式
+
+```bash
+# 建表（独立目录 + 不可混淆的持久身份 table_token）
+python -m shuffle.hist_cli create --workdir .run/work --name cust \
+    --mem-bytes 268435456 --max-open-files 32
+
+# 登记批次：固定完整 winner 清单与批次标识，目标版本 = 当前 head+1
+python -m shuffle.hist_cli submit --workdir .run/work --name cust \
+    --root .run/root --job day1 --batch-id 2026-11-18
+
+# 继续完成入仓：接收→暂存→提交（中断后再跑即从检查点恢复）
+python -m shuffle.hist_cli run    --workdir .run/work --name cust --batch-id 2026-11-18
+
+python -m shuffle.hist_cli status --workdir .run/work --name cust   # head/批次进度/计数器
+python -m shuffle.hist_cli point --workdir .run/work --name cust --entity c1 --time 5 --kversion 3
+python -m shuffle.hist_cli timeline --workdir .run/work --name cust --entity c1 --t0 0 --t1 100 --kversion 3 --limit 50
+python -m shuffle.hist_cli diff --workdir .run/work --name cust --entity c1 --t0 0 --t1 100 --kold 2 --knew 3
+python -m shuffle.hist_cli export --workdir .run/work --name cust --kversion 3 --limit 1000 [--cursor ...]
+python -m shuffle.hist_cli abandon --workdir .run/work --name cust --batch-id 2026-11-18
+python -m shuffle.hist_cli drop --workdir .run/work --name cust
+```
+
+库接口：`shuffle.history.create_table / submit_batch / run_batch（及
+receive_batch / stage_batch / commit_batch 分相）/ abandon_batch /
+table_status / drop_table`；查询句柄 `HistoryTable` 提供
+`point / timeline / diff / export`（均支持 `limit` 分页与 `cursor` 续读）。
+
+## 入仓管线与持久边界
+
+```
+submit   固定完整 winner 清单（段身份/数量/长度/摘要）+ 批次标识，登记源段保护
+receive  逐源段对照批次清单校验 → 追加接收流 → fsync → 段落检查点（不重读已接收）
+stage    流式重读接收流，整批语义校验（单事务）→ 暂存表；非法行使整批不可见
+commit   单 IMMEDIATE 事务：暂存落入 events/buckets、推进 head、标记批次
+```
+
+* **批次幂等**：相同标识 + 完全相同绑定的重送返回原结果（已提交/暂存/失败/
+  放弃均原样返回，不再占版本）；换源、换清单显式冲突；未提交批次在版本推进
+  后重送按"换版本"显式冲突。
+* **提交裁决**：两个本机写进程同时提交同一版本时，`BEGIN IMMEDIATE` 串行化，
+  只有一个可见提交；失败方 `CommitConflict`，不能覆盖或拼接，批次保持
+  staged 可检查后放弃。普通查询看不到半批事实（暂存表不参与查询）。
+* **崩溃恢复**：同步点 `kill-after-receive-segment=k / kill-after-receive /
+  kill-after-stage / kill-after-commit`（退出码 42）。重开后每个版本要么整体
+  存在要么整体不存在；已持久接收的源范围绝不重读；提交已持久但调用者未收到
+  成功时重送幂等。坏段、非法末行或语义冲突使整批保持不可见，旧 head 与旧
+  查询不变，可检查原因并放弃（只释放自己的引用与暂存）。不得用修改源绑定、
+  回写旧知识版本或删除旧事实来"修好"恢复。
+* **段保护**：批次处理期间在源作业 readers 表登记持久保护（destroy 被拒）；
+  完成自有接收后释放引用，之后删除源作业不妨碍继续提交或查询已入仓历史。
+* **可观测**：接收进度、校验好的范围、源文件实际打开次数、落入的断言/撤回
+  数与受影响实体数均可查（`status` 的 batches/counters）。
+
+## 查询语义
+
+* **点查** `point(entity, t, kversion)`：获胜断言或空洞（present=false）。
+* **时间线** `timeline(entity, t0, t1, kversion)`：把有限区间完整切成连续、
+  不重叠、无遗漏的片段；空洞 `present=false`；有事实时返回 payload、获胜
+  event_id 与原上游行身份（job/split/row_number）。只有获胜 event_id 相同的
+  相邻片段才合并，不因 payload 恰好相等而抹掉来源差别。
+* **差异** `diff(entity, t0, t1, kold, knew)`：按两边共同边界切分，只返回
+  存在性/payload/获胜 event_id 改变的片段，并保留两边完整判定。
+* **导出** `export(kversion, [t0,t1])`：流式全实体导出，按实体 UTF-8 字节序
+  （BLOB memcmp，不依赖 SQLite 文本排序的偶然结果）、再按业务时间排列。
+* **版本固定**：查询必须显式选知识版本或在开始时固定当前 head；查询不存在
+  的未来版本显式拒绝（不自动改成最新版本）；未提交批次版本与合法空结果、
+  损坏错误三者严格区分。
+* **游标**：时间线/差异/导出支持受限页长与继续游标。游标绑定表的持久身份、
+  固定知识版本、查询范围及当前位置（含完整性签名）；开始翻页后又提交新批次，
+  后续页仍与原查询逐条一致；进程退出再打开可接着读。把游标用于另一张表、
+  另一组参数、另一种接口，或破坏游标内容，都显式拒绝。
+
+## 正确性依据、增长代价与恢复边界
+
+* **存储**：事件只追加落 `events` 表（含逐行 SHA-256 内容摘要，读取期发现
+  自身存储损坏即显式 `HistoryCorrupt`，不用空列表吞掉异常）。提交事务内同时
+  写入**二分区间桶索引** `buckets`：把每条断言区间分解为 O(log span) 个规范
+  二分桶（时间轴平移到无符号 [0,2^64)，正无穷为 2^64）。点查 = 65 次精确
+  查找；区间查 = 每层一次范围扫描，命中的桶必属与区间相交的断言（真阳性），
+  因此短区间查询只读"覆盖该区间"的事件，不重放全部已提交批次。
+* **裁定**：候选按 valid_from 排序（SQLite 外部排序落盘），开放集合为 Python
+  堆的扫描线算法在本模块内完成——不调用现成时态查询引擎。SQLite 只做持久
+  事务、索引与排序。被 ≤K 撤回命中的断言不产生扫描位置（否则会在死断言端点
+  处错误切开空洞）。
+* **增长代价**：每条断言约 2·log2(span)+2 行桶索引（有限区间通常 < 50，全轴
+  区间 ≤ 130）；事件与桶只增不删，存储随事实数线性增长。
+* **恢复边界**：接收按段落检查点（先 fsync 接收流、再提交 SQLite 检查点）；
+  语义改写先落暂存表；提交为单个 IMMEDIATE 事务。崩溃后：已持久接收的源
+  范围绝不重读；暂存可重做或继续；提交原子生效。
+* **预算**：`mem_bytes` 工作内存（单行上限 = mem_bytes/16，SQLite 页缓存 ≤
+  mem_bytes/4，扫描线开放堆条目 ≤ mem_bytes/2/96）；`max_open_files` 自管数据
+  文件句柄上限（SQLite 连接为固定常数个，不占额度）。解释器固定开销不计入
+  预算，由规模演示单独报告。不把整张表、单实体全部事件、某版本全量视图或
+  全部差异收进 Python 容器：导出逐实体流式，时间线/差异/导出均分页。
+
+## 演示与自测
+
+```bash
+python demo/history_demo.py        # 功能关卡 H1–H8
+python demo/history_scale_demo.py  # 规模关卡 S1–S3（指标报告）
+```
+
+* **H1 手算演示**：v1 断言 A[0,20)"old"；v2 断言 B[5,15)"new"；v3 断言
+  C[8,12)null；v4 撤回 B；v5 撤回 C。版本 2 在 [0,20) 的来源依次 A/B/A，
+  版本 3 为 A/B/C/B/A，版本 4 为 A/C/A，版本 5 重新只有 A；任何后续操作
+  （含空批次 v6）都不改变版本 2 的查询。v3→v4 在 [0,20) 的差异只有 [5,8)
+  与 [12,15) 两段 B→A，C 的 null 不当成空洞。
+* **H2–H8**：同批重叠、不同分区规则、同内容不同 ID、相同 ID 跨实体冲突、
+  错误撤回、批尾错误（逐项对照独立参考）；并发提交裁决与游标快照（独立
+  进程交错写入与翻页）；同步点杀进程恢复；键/值语义；分页与游标；自身
+  存储损坏显式报错；CLI 端到端。
+* **S1–S3**：8,000 实体超内存入仓 + 全量导出；单实体 3 万事件超内存 +
+  短区间查询指标（实际访问历史记录 ≪ 总事件、源打开次数 = 0）+ 独立端点
+  枚举与抽样验证；大批次杀进程恢复与幂等重送。报告真实入仓/输出数量、
+  RSS、临时磁盘与文件峰值。规模数据全部运行时生成，落在 `.run/` 下不进 Git。
+
+原交换层（create/launch-attempt/inspect/read-partition/recover/cleanup）与
+关联算子（join）接口保持不变，可继续独立使用。

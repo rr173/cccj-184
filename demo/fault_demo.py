@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -64,6 +65,7 @@ def _precommit_child(root: str, job: str) -> None:
 
 
 def main() -> None:
+    shutil.rmtree(ROOT, ignore_errors=True)
     os.makedirs(ROOT, exist_ok=True)
     layout = Layout(ROOT)
     in_dir = os.path.join(ROOT, "inputs")

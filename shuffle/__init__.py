@@ -8,7 +8,9 @@
                          recover / cleanup 命令行接口
     shuffle.join         双输入关联算子：消费两个作业的 winner 段，落盘关联结果
     shuffle.join_cli     关联算子命令行接口 create/run/status/read/delete
+    shuffle.history      双时间历史表：知识版本 × 业务时间的入仓与查询
+    shuffle.hist_cli     历史表命令行接口 create/submit/run/status/point/...
 """
 
 __all__ = ["common", "coordinator", "worker", "reader", "cli",
-           "join_common", "join", "join_cli"]
+           "join_common", "join", "join_cli", "history", "hist_cli"]

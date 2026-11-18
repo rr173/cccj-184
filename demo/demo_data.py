@@ -39,8 +39,12 @@ def directory_size(path: str) -> int:
     for dirpath, _dirs, files in os.walk(path):
         for name in files:
             fp = os.path.join(dirpath, name)
-            if os.path.isfile(fp):
-                total += os.path.getsize(fp)
+            try:
+                if os.path.isfile(fp):
+                    total += os.path.getsize(fp)
+            except FileNotFoundError:
+                # 测量期间 WAL 等文件可能被检查点移除/重建，跳过即可
+                continue
     return total
 
 
