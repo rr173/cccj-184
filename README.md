@@ -381,3 +381,140 @@ python demo/history_scale_demo.py  # 规模关卡 S1–S3（指标报告）
 
 原交换层（create/launch-attempt/inspect/read-partition/recover/cleanup）与
 关联算子（join）接口保持不变，可继续独立使用。
+
+---
+
+# 时态引用完整性审计（shuffle.audit）
+
+历史表回答"某实体在某段业务时间、某个知识版本里是什么"；审计回答其上的
+**跨实体引用完整性**：源实体每条获胜事实在其**整个生效区间**内，payload
+引用字段指向的目标实体是否始终存在。只处理已提交历史——审计不修改事件、
+知识版本或 head；head 之后推进不改变已开始审计的结果。
+
+```
+shuffle/
+  audit.py      审计算子：create/run/status/read/delete + 扫描/物化/终验
+  audit_cli.py  命令行接口（python -m shuffle.audit_cli ...）
+demo/
+  audit_ref.py        独立参考（只读原始断言、枚举端点，不调产品逻辑）
+  audit_demo.py       功能关卡 A1–A10（真实工人建输入，逐项对照参考）
+  audit_scale_demo.py 规模关卡 AS1（7.5k 实体、3.4 万事件、超内存审计）
+  audit_child.py      演示子进程（流式整流核验）
+```
+
+## 审计规格与规则
+
+建审计时固定：历史表（绑定其持久身份 table_token）、知识版本 K（显式给定
+或固定当前 head）、业务区间 `[t0, t1)`（t1 缺省为正无穷）、规则集合。
+每条规则：
+
+```json
+{"rule_id": "owner-ref",
+ "source": {"kind": "prefix", "prefix": "cust:"},
+ "path": ["owner", "id"]}
+```
+
+* `rule_id` 全局唯一；`source.kind ∈ all / prefix / entities`（源实体范围）；
+* `path` 是 payload 中的 JSON 字段路径（1–8 个非空字符串）；字段值必须是
+  字符串，即目标实体键。非法字段路径、非法源范围、重复 rule_id 在建审计
+  时明确报错。
+
+## 判定语义
+
+* **源引用区间** = 源实体在 [t0,t1)、版本 K 下按历史表裁定规则的获胜片段
+  （相邻同 event_id 已合并）；空洞（present=false）没有引用，不产生结果。
+* 对每段源引用区间提取目标键，用**两侧时间线的区间交集**判定整个区间
+  （不是只查区间起点）：目标时间线空洞 ∩ 源区间 = 缺失子区间，逐段输出。
+  目标 payload 为 JSON null 仍算存在；没有事实才是缺失。源引用值变化、
+  源事实被覆盖或撤回、目标实体出现或消失，都在相应边界切开结果。
+* **缺失原因**（严格区分，不混为一类）：`missing_field`（payload 缺字段，
+  目标键=null）、`null_reference`（字段值为 JSON null，目标键=null）、
+  `empty_target`（字段值为空串，目标键=""）、`target_absent`（目标实体
+  在子区间内无事实）。
+* **明确报错**：非字符串目标键、payload 不是对象等不支持的 JSON 形态，
+  运行期遇到即把审计置为 `failed` 并记录规则/源实体/事件——不静默跳过
+  源事实；失败审计拒绝读取。
+* **结果次序**（固定）：源实体 UTF-8 字节序 → rule_id → 目标键 UTF-8
+  字节序（null 目标最前）→ 区间起点 → 源 event_id。相邻区间只有（源
+  实体、rule_id、目标键、源 event_id、缺失原因）完全相同且首尾相接才
+  合并。每条结果记录：`{seq, entity, rule_id, target, start, end,
+  kversion, event_id, reason}`（end=null 表示正无穷）。
+
+## 使用方式
+
+```bash
+# 建审计（规则集合用 JSON 文件或内联 JSON 给出）
+python -m shuffle.audit_cli create --root .run/audits --name a1 \
+    --table-workdir .run/work --table cust \
+    --t0 0 --t1 100000 --kversion 3 \
+    --rules-file rules.json --mem-bytes 1048576 --max-open-files 24
+
+python -m shuffle.audit_cli run    --root .run/audits --name a1   # 中断后再跑即恢复
+python -m shuffle.audit_cli status --root .run/audits --name a1   # 状态/进度/真实读取量
+python -m shuffle.audit_cli read   --root .run/audits --name a1 --limit 100 [--cursor ...]
+python -m shuffle.audit_cli delete --root .run/audits --name a1   # 只移除审计自己的目录
+```
+
+库接口：`shuffle.audit.create_audit / run_audit / audit_status / read_audit /
+delete_audit`。`read_audit(limit, cursor)` 分页拼接与整次读取一致。
+
+## 实现路线与代价（路线 a：逐源区间读目标时间线 + 流式求交）
+
+候选路线：(a) 逐个源引用区间用历史表持久桶索引读取对应目标实体的时间线
+并流式求交；(b) 把双方相关区间有界外排后按目标键归并扫描。本实现采用
+**(a) 扫描 + 有界外排定序**，两条路线在规格上必须得到完全相同的缺失区间
+与固定结果次序——正确性由独立端点枚举参考（`demo/audit_ref.py`，不调用
+产品 timeline/审计逻辑）逐条对照保证。
+
+* **读取代价**：O(源获胜片段数 × (65 次桶探测 + 相交目标事件数))。短业务
+  区间下桶索引只取与源片段相交的目标事件（真阳性），不重放目标全部历史；
+  源/目标各一条只读连接（各自独立的临时候选表，互不干扰）。真实读取量
+  （源/目标候选数、检查事件数、目标查询次数、源段打开次数=0）全部落
+  counters 可查。
+* **暂存空间**：缺失发现先落审计自有 SQLite 的 findings 表；物化时受限
+  内存分块排序（块 = mem_bytes/4）溢写 run 文件（审计 `tmp/` 目录），
+  受限扇入归并后相邻合并，写框式结果流 + 稀疏索引（tmp + 原子改名）。
+  全部缺失区间不进入 Python 容器。
+* **恢复边界**：扫描按 (源实体, 规则) 对一个事务（findings + 进度检查点
+  同事务提交），已提交的对绝不重算；物化检查点（记录数/摘要/字节数）
+  落库后结果文件才生效；终验整流重读（逐条摘要、序号连续、次序严格
+  递增、无应合并而未合并的相邻记录、总数与摘要等于检查点）通过才置
+  `done`。同步关卡（`SHUFFLE_AUDIT_HOOK` 或 `--hook`）：
+  `kill-after-audit-pair=N` / `kill-after-materialize` / `kill-before-done`，
+  受控终止退出码 42。
+* **读取**：只有 `done` 才可读——结果未完成或已损坏时不返回成功前缀。
+  每次打开复核 header/footer 与元数据的记录数、摘要；读到的每条记录
+  再验摘要与序号。游标绑定审计身份、表持久身份、知识版本、业务区间、
+  规则集合与当前位置（含完整性签名）：换审计、换参数、换表或破坏游标
+  都显式拒绝；进程退出再打开可接着读。
+* **预算**：`mem_bytes`（单行上限 = mem_bytes/16，排序块 = mem_bytes/4，
+  SQLite 页缓存 ≤ mem_bytes/4）与 `max_open_files`（审计自管数据文件
+  句柄上限，句柄账本强制，峰值落库）；历史表查询侧上限由历史表自身
+  预算约束。全表实体、单个实体的全部历史、全部缺失区间都不放入
+  Python 容器。所有审计文件限于自身受管目录；删除或失败不影响历史表、
+  其他审计或正在读取的结果。
+
+## 审计演示
+
+```bash
+python demo/audit_demo.py        # 功能关卡 A1–A10
+python demo/audit_scale_demo.py  # 规模关卡 AS1（指标报告）
+```
+
+* **A1–A10**：规格手算（目标 [0,10) 存在/[10,20) 缺失 × 源 [5,15) 只报
+  [10,15)；null payload 的 [15,20) 仍存在；v2 撤回目标后 v1 审计与游标
+  结果不变）、源引用替换、局部覆盖后撤回、缺字段/空串/null/非法类型、
+  目标与源边界重合、负时间/int64 极值/无穷端点、空结果、分页跨页、
+  翻页途中提交新知识版本、三同步点杀进程恢复（已提交对绝不重算）、
+  审计文件损坏（记录/索引/截断）、两个审计并行清理、CLI 端到端。
+* **AS1**：5,000 源实体 + 2,500 目标实体 + 热点实体（3,000 事件）、
+  6 批交错长历史（33,992 事件），审计预算 1 MiB、短业务区间
+  [-30000, 30000)。实测：扫描源区间 12,156 段、目标查询 12,156 次、
+  源段打开 0 次、实际检查目标事件 119 条（≪ 目标事件总数 5,990，持久
+  索引收窄）、缺失输出 12,143 条、审计进程峰值 RSS ≈ 23 MiB、临时磁盘
+  峰值 ≈ 8.9 MiB（超 1 MiB 预算，外排生效）、句柄峰值 9；25 个源实体
+  抽样与独立参考逐条一致。
+
+原交换层、关联算子（join）与历史表（history）既有接口保持不变；本次新增
+的是跨实体引用完整性审计，不重做已有的单实体时间线、差异查询或双输入
+关联。

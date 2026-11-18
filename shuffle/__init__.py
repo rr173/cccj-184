@@ -10,7 +10,10 @@
     shuffle.join_cli     关联算子命令行接口 create/run/status/read/delete
     shuffle.history      双时间历史表：知识版本 × 业务时间的入仓与查询
     shuffle.hist_cli     历史表命令行接口 create/submit/run/status/point/...
+    shuffle.audit        时态引用完整性审计：固定知识版本下源引用区间 ∩ 目标存在区间
+    shuffle.audit_cli    审计命令行接口 create/run/status/read/delete
 """
 
 __all__ = ["common", "coordinator", "worker", "reader", "cli",
-           "join_common", "join", "join_cli", "history", "hist_cli"]
+           "join_common", "join", "join_cli", "history", "hist_cli",
+           "audit", "audit_cli"]
